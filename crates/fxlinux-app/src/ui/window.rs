@@ -45,10 +45,8 @@ pub fn build(app: &adw::Application, worker: Rc<PwWorker>, status_rx: mpsc::Rece
 
     let slider_rows: Rc<RefCell<Vec<SliderRow>>> = Rc::new(RefCell::new(Vec::new()));
 
-    // "Music" is closest to the values confirmed by ear during M1 tuning, so
-    // it's the launch default rather than "Flat / Reference". Found by name,
-    // not a hardcoded index — preset order can shift once user-saved
-    // presets exist.
+    // Music remains the launch default rather than Flat / Reference. Find it
+    // by name because preset order can shift once user presets exist.
     let initial_index = presets.iter().position(|p| p.name == "Music").unwrap_or(0);
     let initial = presets.get(initial_index).cloned();
     preset_dropdown.set_selected(initial_index as u32);
@@ -139,7 +137,7 @@ fn slider_value(preset: &Preset, id: ControlId) -> f64 {
 }
 
 /// Moves each slider to match `preset` without re-triggering their own
-/// `value-changed` handlers — the preset apply already pushes the full
+/// `value-changed` handlers because the preset apply already pushes the full
 /// parameter set in one batch, so a handler firing here would just resend a
 /// redundant, partially-stale update.
 fn apply_preset_to_ui(preset: &Preset, slider_rows: &Rc<RefCell<Vec<SliderRow>>>) {
