@@ -2,7 +2,7 @@
 //!
 //! EQ bands correspond to the LSP 8-band parametric EQ's *fixed* default
 //! center frequencies (confirmed against the installed plugin's own TTL,
-//! not guessed): 16 / 40 / 100 / 250 / 630 / 1600 / 4000 / 10000 Hz — close
+//! not guessed): 16 / 40 / 100 / 250 / 630 / 1600 / 4000 / 10000 Hz. These are close
 //! to a standard octave-ish graphic EQ layout, so no per-band frequency
 //! control is needed, only gain.
 //!
@@ -18,7 +18,7 @@
 //! Adaptive bass leveling (gentle downward compression on the multiband
 //! compressor's 0-1kHz band, so already-hot bass gets reined in
 //! automatically instead of needing the Bass slider retuned per track) is
-//! static in the filter-chain config, not part of the preset schema — it
+//! static in the filter-chain config, not part of the preset schema. It
 //! applies uniformly under whatever bass boost a preset or slider sets.
 
 use serde::{Deserialize, Serialize};

@@ -1,5 +1,5 @@
 use crate::audio::controls::ControlId;
-use crate::audio::pw_worker::PwWorker;
+use crate::audio::pw_worker::{PwWorker, RouteStatus};
 use crate::presets::{model::Preset, store};
 use gtk::glib::{ControlFlow, SignalHandlerId};
 use gtk::prelude::*;
@@ -21,12 +21,12 @@ struct SliderRow {
     handler_id: SignalHandlerId,
 }
 
-pub fn build(app: &adw::Application, worker: Rc<PwWorker>, status_rx: mpsc::Receiver<bool>) {
+pub fn build(app: &adw::Application, worker: Rc<PwWorker>, status_rx: mpsc::Receiver<RouteStatus>) {
     let presets = Rc::new(store::load_all());
 
     let header = gtk::HeaderBar::new();
 
-    let banner = adw::Banner::new("Audio engine not connected — is filter-chain.service running?");
+    let banner = adw::Banner::new("Audio route status is unavailable.");
     banner.set_revealed(false);
 
     let content = gtk::Box::builder()
@@ -45,22 +45,14 @@ pub fn build(app: &adw::Application, worker: Rc<PwWorker>, status_rx: mpsc::Rece
 
     let slider_rows: Rc<RefCell<Vec<SliderRow>>> = Rc::new(RefCell::new(Vec::new()));
 
-    // "Music" is closest to the values confirmed by ear during M1 tuning, so
-    // it's the launch default rather than "Flat / Reference". Found by name,
-    // not a hardcoded index — preset order can shift once user-saved
-    // presets exist.
-    let initial_index = presets
-        .iter()
-        .position(|p| p.name == "Music")
-        .unwrap_or(0);
+    // Music remains the launch default rather than Flat / Reference. Find it
+    // by name because preset order can shift once user presets exist.
+    let initial_index = presets.iter().position(|p| p.name == "Music").unwrap_or(0);
     let initial = presets.get(initial_index).cloned();
     preset_dropdown.set_selected(initial_index as u32);
 
     for &(id, label) in SLIDER_IDS {
-        let initial_value = initial
-            .as_ref()
-            .map(|p| slider_value(p, id))
-            .unwrap_or(0.5);
+        let initial_value = initial.as_ref().map(|p| slider_value(p, id)).unwrap_or(0.5);
         let (row_widget, row) = build_slider_row(id, label, initial_value, worker.clone());
         content.append(&row_widget);
         slider_rows.borrow_mut().push(row);
@@ -72,7 +64,9 @@ pub fn build(app: &adw::Application, worker: Rc<PwWorker>, status_rx: mpsc::Rece
         let slider_rows = slider_rows.clone();
         preset_dropdown.connect_selected_notify(move |dd| {
             let idx = dd.selected() as usize;
-            let Some(preset) = presets.get(idx) else { return };
+            let Some(preset) = presets.get(idx) else {
+                return;
+            };
             apply_preset_to_ui(preset, &slider_rows);
             worker.apply_preset(preset.clone());
         });
@@ -100,11 +94,32 @@ pub fn build(app: &adw::Application, worker: Rc<PwWorker>, status_rx: mpsc::Rece
     // widgets aren't Send).
     gtk::glib::timeout_add_local(Duration::from_millis(300), move || {
         let mut last = None;
-        while let Ok(connected) = status_rx.try_recv() {
-            last = Some(connected);
+        while let Ok(status) = status_rx.try_recv() {
+            last = Some(status);
         }
-        if let Some(connected) = last {
-            banner.set_revealed(!connected);
+        if let Some(status) = last {
+            match status {
+                RouteStatus::EngineMissing => {
+                    banner.set_title("Audio engine is not running. Start filter-chain.service.");
+                    banner.set_revealed(true);
+                }
+                RouteStatus::OutputMissing => {
+                    banner.set_title(
+                        "FxLinux output stream is missing. Restart filter-chain.service.",
+                    );
+                    banner.set_revealed(true);
+                }
+                RouteStatus::OutputUnlinked => {
+                    banner.set_title("FxLinux output is not connected to an audio sink.");
+                    banner.set_revealed(true);
+                }
+                RouteStatus::OutputMisrouted => {
+                    banner
+                        .set_title("FxLinux output is connected, but not to a usable audio sink.");
+                    banner.set_revealed(true);
+                }
+                RouteStatus::Healthy { .. } => banner.set_revealed(false),
+            }
         }
         ControlFlow::Continue
     });
@@ -122,7 +137,7 @@ fn slider_value(preset: &Preset, id: ControlId) -> f64 {
 }
 
 /// Moves each slider to match `preset` without re-triggering their own
-/// `value-changed` handlers — the preset apply already pushes the full
+/// `value-changed` handlers because the preset apply already pushes the full
 /// parameter set in one batch, so a handler firing here would just resend a
 /// redundant, partially-stale update.
 fn apply_preset_to_ui(preset: &Preset, slider_rows: &Rc<RefCell<Vec<SliderRow>>>) {
