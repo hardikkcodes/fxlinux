@@ -13,7 +13,7 @@
 //! `PwWorker::spawn` hands the receiver to the caller to poll on the GTK
 //! main loop instead).
 
-use crate::audio::controls::{updates_for, ControlId};
+use crate::audio::controls::{ControlId, updates_for};
 use crate::presets::model::Preset;
 use pipewire as pw;
 use pw::spa::param::ParamType;
@@ -21,6 +21,7 @@ use pw::spa::pod::serialize::PodSerializer;
 use pw::spa::pod::{Object, Pod, Property, PropertyFlags, Value};
 use pw::spa::utils::SpaTypes;
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::io::Cursor;
 use std::rc::Rc;
 use std::sync::mpsc;
@@ -30,6 +31,92 @@ use std::thread::JoinHandle;
 // libspa-0.2-dev headers and cross-checked with `pw-cli e <id> Props`.
 const SPA_PROP_PARAMS: u32 = 524289;
 const TARGET_NODE_NAME: &str = "fxlinux_input";
+const OUTPUT_NODE_NAME: &str = "fxlinux_output";
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RouteStatus {
+    EngineMissing,
+    OutputMissing,
+    OutputUnlinked,
+    OutputMisrouted,
+    Healthy { sink_description: Option<String> },
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct NodeInfo {
+    name: String,
+    description: Option<String>,
+    media_class: Option<String>,
+    is_virtual: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct LinkInfo {
+    output_node: u32,
+    input_node: u32,
+}
+
+#[derive(Default)]
+struct RouteState {
+    nodes: HashMap<u32, NodeInfo>,
+    links: HashMap<u32, LinkInfo>,
+}
+
+impl RouteState {
+    fn evaluate(&self) -> RouteStatus {
+        if !self
+            .nodes
+            .values()
+            .any(|node| node.name == TARGET_NODE_NAME)
+        {
+            return RouteStatus::EngineMissing;
+        }
+
+        let Some(output_id) = self
+            .nodes
+            .iter()
+            .filter_map(|(&id, node)| (node.name == OUTPUT_NODE_NAME).then_some(id))
+            .min()
+        else {
+            return RouteStatus::OutputMissing;
+        };
+
+        let mut downstream: Vec<_> = self
+            .links
+            .values()
+            .filter(|link| link.output_node == output_id)
+            .collect();
+        if downstream.is_empty() {
+            return RouteStatus::OutputUnlinked;
+        }
+
+        // HashMap iteration is deliberately normalized so evaluation and its
+        // tests stay deterministic if more than one route is present.
+        downstream.sort_by_key(|link| link.input_node);
+        for link in downstream {
+            let Some(sink) = self.nodes.get(&link.input_node) else {
+                continue;
+            };
+            let is_fxlinux_node = sink.name.starts_with("fxlinux_");
+            if sink.media_class.as_deref() == Some("Audio/Sink")
+                && sink.name != TARGET_NODE_NAME
+                && !is_fxlinux_node
+                && !sink.is_virtual
+            {
+                return RouteStatus::Healthy {
+                    sink_description: sink.description.clone(),
+                };
+            }
+        }
+
+        RouteStatus::OutputMisrouted
+    }
+
+    fn remove_global(&mut self, id: u32) {
+        self.nodes.remove(&id);
+        self.links.remove(&id);
+    }
+}
 
 pub enum ControlMsg {
     SetSlider(ControlId, f64),
@@ -76,14 +163,13 @@ pub struct PwWorker {
 }
 
 impl PwWorker {
-    /// Returns the worker plus a receiver for connection-status updates
-    /// (`true` = connected to the live node, `false` = lost/not found yet).
+    /// Returns the worker plus a receiver for route-health updates.
     /// Poll the receiver from the GTK main loop (e.g. via
     /// `glib::timeout_add_local`) — never touch GTK widgets from this
     /// worker's own thread.
-    pub fn spawn() -> (Self, mpsc::Receiver<bool>) {
+    pub fn spawn() -> (Self, mpsc::Receiver<RouteStatus>) {
         let (sender, receiver) = pw::channel::channel::<ControlMsg>();
-        let (status_tx, status_rx) = mpsc::channel::<bool>();
+        let (status_tx, status_rx) = mpsc::channel::<RouteStatus>();
         let thread = std::thread::spawn(move || run(receiver, status_tx));
         (
             Self {
@@ -105,13 +191,13 @@ impl PwWorker {
     }
 }
 
-fn run(receiver: pw::channel::Receiver<ControlMsg>, status_tx: mpsc::Sender<bool>) {
+fn run(receiver: pw::channel::Receiver<ControlMsg>, status_tx: mpsc::Sender<RouteStatus>) {
     pw::init();
     inner_run(receiver, status_tx);
     unsafe { pw::deinit() };
 }
 
-fn inner_run(receiver: pw::channel::Receiver<ControlMsg>, status_tx: mpsc::Sender<bool>) {
+fn inner_run(receiver: pw::channel::Receiver<ControlMsg>, status_tx: mpsc::Sender<RouteStatus>) {
     let mainloop = pw::main_loop::MainLoopRc::new(None).expect("Failed to create main loop");
     let context = pw::context::ContextRc::new(&mainloop, None).expect("Failed to create context");
     let core = context.connect_rc(None).expect("Failed to connect to core");
@@ -120,53 +206,96 @@ fn inner_run(receiver: pw::channel::Receiver<ControlMsg>, status_tx: mpsc::Sende
     let node: Rc<RefCell<Option<pw::node::Node>>> = Rc::new(RefCell::new(None));
     let node_id: Rc<RefCell<Option<u32>>> = Rc::new(RefCell::new(None));
     let last_preset: Rc<RefCell<Option<Preset>>> = Rc::new(RefCell::new(None));
+    let route_state = Rc::new(RefCell::new(RouteState::default()));
+    let last_status: Rc<RefCell<Option<RouteStatus>>> = Rc::new(RefCell::new(None));
 
     let registry_for_global = registry.clone();
     let node_for_global = node.clone();
     let node_id_for_global = node_id.clone();
     let last_preset_for_global = last_preset.clone();
+    let route_state_for_global = route_state.clone();
+    let last_status_for_global = last_status.clone();
     let status_tx_for_global = status_tx.clone();
     let _listener_reg = registry
         .add_listener_local()
         .global(move |global| {
             let Some(props) = &global.props else { return };
-            if props.get("node.name") != Some(TARGET_NODE_NAME) {
-                return;
-            }
-            match registry_for_global.bind::<pw::node::Node, _>(global) {
-                Ok(bound) => {
-                    println!("fxlinux-app: found {TARGET_NODE_NAME} (id={})", global.id);
-                    // If we'd already applied a preset before this node
-                    // appeared (or reappeared after filter-chain.service
-                    // restarted), re-push it now instead of silently
-                    // leaving the node on its static .conf defaults.
-                    if let Some(preset) = last_preset_for_global.borrow().as_ref() {
-                        push_controls(&bound, &preset_updates(preset));
+            match global.type_ {
+                pw::types::ObjectType::Node => {
+                    let name = props.get("node.name").unwrap_or_default().to_string();
+                    route_state_for_global.borrow_mut().nodes.insert(
+                        global.id,
+                        NodeInfo {
+                            name: name.clone(),
+                            description: props.get("node.description").map(str::to_string),
+                            media_class: props.get("media.class").map(str::to_string),
+                            is_virtual: props.get("node.virtual") == Some("true"),
+                        },
+                    );
+
+                    if name == TARGET_NODE_NAME {
+                        match registry_for_global.bind::<pw::node::Node, _>(global) {
+                            Ok(bound) => {
+                                println!(
+                                    "fxlinux-app: found {TARGET_NODE_NAME} (id={})",
+                                    global.id
+                                );
+                                // Re-push the selected preset after a service restart.
+                                if let Some(preset) = last_preset_for_global.borrow().as_ref() {
+                                    push_controls(&bound, &preset_updates(preset));
+                                }
+                                *node_for_global.borrow_mut() = Some(bound);
+                                *node_id_for_global.borrow_mut() = Some(global.id);
+                            }
+                            Err(e) => eprintln!("fxlinux-app: bind failed: {e}"),
+                        }
                     }
-                    *node_for_global.borrow_mut() = Some(bound);
-                    *node_id_for_global.borrow_mut() = Some(global.id);
-                    let _ = status_tx_for_global.send(true);
                 }
-                Err(e) => eprintln!("fxlinux-app: bind failed: {e}"),
+                pw::types::ObjectType::Link => {
+                    let endpoints = props
+                        .get("link.output.node")
+                        .and_then(|id| id.parse().ok())
+                        .zip(props.get("link.input.node").and_then(|id| id.parse().ok()));
+                    if let Some((output_node, input_node)) = endpoints {
+                        route_state_for_global.borrow_mut().links.insert(
+                            global.id,
+                            LinkInfo {
+                                output_node,
+                                input_node,
+                            },
+                        );
+                    }
+                }
+                _ => {}
             }
+
+            report_status(
+                &route_state_for_global,
+                &last_status_for_global,
+                &status_tx_for_global,
+            );
         })
         .global_remove({
             let node = node.clone();
             let node_id = node_id.clone();
+            let route_state = route_state.clone();
+            let last_status = last_status.clone();
             let status_tx = status_tx.clone();
             move |id| {
                 if node_id.borrow().as_ref() == Some(&id) {
                     println!("fxlinux-app: {TARGET_NODE_NAME} disappeared (id={id})");
                     *node.borrow_mut() = None;
                     *node_id.borrow_mut() = None;
-                    let _ = status_tx.send(false);
                 }
+                route_state.borrow_mut().remove_global(id);
+                report_status(&route_state, &last_status, &status_tx);
             }
         })
         .register();
 
     // Cloned before `node` is moved into the receiver closure below.
-    let node_for_timer = Rc::downgrade(&node);
+    let route_state_for_timer = Rc::downgrade(&route_state);
+    let last_status_for_timer = Rc::downgrade(&last_status);
 
     let _receiver = receiver.attach(mainloop.loop_(), move |msg| {
         // ApplyPreset is always remembered regardless of connection state —
@@ -199,20 +328,31 @@ fn inner_run(receiver: pw::channel::Receiver<ControlMsg>, status_tx: mpsc::Sende
         }
     });
 
-    // Timer fires once shortly after startup so the UI can show "not
-    // connected" if the node genuinely never appears (filter-chain.service
-    // not running), rather than staying silent forever.
+    // Ensure an empty registry still produces a status after startup.
     let status_tx_for_timer = status_tx.clone();
     let timer = mainloop.loop_().add_timer(move |_| {
-        if let Some(node) = node_for_timer.upgrade() {
-            if node.borrow().is_none() {
-                let _ = status_tx_for_timer.send(false);
-            }
+        if let (Some(route_state), Some(last_status)) = (
+            route_state_for_timer.upgrade(),
+            last_status_for_timer.upgrade(),
+        ) {
+            report_status(&route_state, &last_status, &status_tx_for_timer);
         }
     });
     timer.update_timer(Some(std::time::Duration::from_secs(3)), None);
 
     mainloop.run();
+}
+
+fn report_status(
+    state: &Rc<RefCell<RouteState>>,
+    last_status: &Rc<RefCell<Option<RouteStatus>>>,
+    sender: &mpsc::Sender<RouteStatus>,
+) {
+    let status = state.borrow().evaluate();
+    if last_status.borrow().as_ref() != Some(&status) {
+        *last_status.borrow_mut() = Some(status.clone());
+        let _ = sender.send(status);
+    }
 }
 
 /// Pushes every `(key, value)` pair as a single `Props` update — one struct
@@ -249,4 +389,116 @@ fn push_controls(node: &pw::node::Node, pairs: &[(String, f32)]) {
         return;
     };
     node.set_param(ParamType::Props, 0, pod);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn node(name: &str, media_class: Option<&str>, description: Option<&str>) -> NodeInfo {
+        NodeInfo {
+            name: name.to_string(),
+            description: description.map(str::to_string),
+            media_class: media_class.map(str::to_string),
+            is_virtual: false,
+        }
+    }
+
+    fn state_with_engine() -> RouteState {
+        let mut state = RouteState::default();
+        state.nodes.insert(
+            10,
+            node(TARGET_NODE_NAME, Some("Audio/Sink"), Some("FxLinux")),
+        );
+        state.nodes.insert(20, node(OUTPUT_NODE_NAME, None, None));
+        state
+    }
+
+    #[test]
+    fn reports_missing_engine() {
+        assert_eq!(RouteState::default().evaluate(), RouteStatus::EngineMissing);
+    }
+
+    #[test]
+    fn reports_present_but_unlinked_output() {
+        assert_eq!(state_with_engine().evaluate(), RouteStatus::OutputUnlinked);
+    }
+
+    #[test]
+    fn reports_healthy_real_sink_with_description() {
+        let mut state = state_with_engine();
+        state.nodes.insert(
+            30,
+            node(
+                "alsa_output.pci-0000_00_1f.3.analog-stereo",
+                Some("Audio/Sink"),
+                Some("Built-in Audio Analog Stereo"),
+            ),
+        );
+        state.links.insert(
+            40,
+            LinkInfo {
+                output_node: 20,
+                input_node: 30,
+            },
+        );
+
+        assert_eq!(
+            state.evaluate(),
+            RouteStatus::Healthy {
+                sink_description: Some("Built-in Audio Analog Stereo".to_string())
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_fxlinux_or_virtual_sink_routes() {
+        let mut state = state_with_engine();
+        state.nodes.insert(
+            30,
+            node(
+                "fxlinux_monitor",
+                Some("Audio/Sink"),
+                Some("FxLinux monitor"),
+            ),
+        );
+        state.links.insert(
+            40,
+            LinkInfo {
+                output_node: 20,
+                input_node: 30,
+            },
+        );
+
+        assert_eq!(state.evaluate(), RouteStatus::OutputMisrouted);
+
+        state.nodes.get_mut(&30).unwrap().name = "other_virtual_sink".to_string();
+        state.nodes.get_mut(&30).unwrap().is_virtual = true;
+        assert_eq!(state.evaluate(), RouteStatus::OutputMisrouted);
+    }
+
+    #[test]
+    fn route_removal_returns_to_unlinked() {
+        let mut state = state_with_engine();
+        state.nodes.insert(
+            30,
+            node(
+                "alsa_output.usb-headset",
+                Some("Audio/Sink"),
+                Some("USB Headset"),
+            ),
+        );
+        state.links.insert(
+            40,
+            LinkInfo {
+                output_node: 20,
+                input_node: 30,
+            },
+        );
+        assert!(matches!(state.evaluate(), RouteStatus::Healthy { .. }));
+
+        state.remove_global(40);
+
+        assert_eq!(state.evaluate(), RouteStatus::OutputUnlinked);
+    }
 }
