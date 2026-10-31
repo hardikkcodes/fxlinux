@@ -13,6 +13,7 @@ const MANAGED_MARKER: &str = "# Managed by FxLinux. Changes will be replaced on 
 const AUTOSTART_MARKER: &str = "# Managed by FxLinux. Changes will be replaced on upgrade.";
 const CONFIG_RELATIVE_PATH: &str = "pipewire/filter-chain.conf.d/99-fxlinux.conf";
 const AUTOSTART_RELATIVE_PATH: &str = "autostart/io.github.fxlinux.FxLinux.desktop";
+const APPLICATION_RELATIVE_PATH: &str = "applications/io.github.fxlinux.FxLinux.desktop";
 
 #[derive(Debug, PartialEq, Eq)]
 struct Sink {
@@ -34,6 +35,7 @@ pub fn run(output: Option<&str>) -> Result<()> {
     let home_dir = base.home_dir();
     let config_path = config_dir.join(CONFIG_RELATIVE_PATH);
     let autostart_path = config_dir.join(AUTOSTART_RELATIVE_PATH);
+    let application_path = base.data_dir().join(APPLICATION_RELATIVE_PATH);
     let binary_path = home_dir.join(".local/bin/fxlinux-app");
     let current_exe = std::env::current_exe().context("resolving current executable path")?;
 
@@ -42,13 +44,17 @@ pub fn run(output: Option<&str>) -> Result<()> {
 
     validate_executable(&current_exe)?;
     let config_decision = managed_file_decision(&config_path, &rendered_config, MANAGED_MARKER)?;
-    let autostart = render_autostart(&binary_path)?;
-    let autostart_decision = managed_file_decision(&autostart_path, &autostart, AUTOSTART_MARKER)?;
+    let desktop_entry = render_desktop_entry(&binary_path)?;
+    let autostart_decision =
+        managed_file_decision(&autostart_path, &desktop_entry, AUTOSTART_MARKER)?;
+    let application_decision =
+        managed_file_decision(&application_path, &desktop_entry, AUTOSTART_MARKER)?;
     validate_binary_destination(&binary_path)?;
 
     install_managed_file(&config_path, &rendered_config, config_decision)?;
     install_binary(&current_exe, &binary_path)?;
-    install_managed_file(&autostart_path, &autostart, autostart_decision)?;
+    install_managed_file(&autostart_path, &desktop_entry, autostart_decision)?;
+    install_managed_file(&application_path, &desktop_entry, application_decision)?;
     enable_and_restart_filter_chain_service()?;
 
     println!(
@@ -59,6 +65,7 @@ pub fn run(output: Option<&str>) -> Result<()> {
     println!("- Application: {}", binary_path.display());
     println!("- filter-chain.service: enabled and active");
     println!("- Control panel autostart: {}", autostart_path.display());
+    println!("- Application launcher: {}", application_path.display());
     println!();
     println!("Select the FxLinux sink in your desktop sound settings to use the enhancer.");
     Ok(())
@@ -69,10 +76,12 @@ pub fn uninstall() -> Result<()> {
     let config_dir = base.config_dir();
     let config_path = config_dir.join(CONFIG_RELATIVE_PATH);
     let autostart_path = config_dir.join(AUTOSTART_RELATIVE_PATH);
+    let application_path = base.data_dir().join(APPLICATION_RELATIVE_PATH);
     let binary_path = base.home_dir().join(".local/bin/fxlinux-app");
 
     let removed_config = remove_if_managed(&config_path, MANAGED_MARKER)?;
     remove_if_managed(&autostart_path, AUTOSTART_MARKER)?;
+    remove_if_managed(&application_path, AUTOSTART_MARKER)?;
     remove_installed_binary(&binary_path)?;
 
     if removed_config {
@@ -248,7 +257,7 @@ fn render_filter_chain(target: &str) -> Result<String> {
     Ok(FILTER_CHAIN_TEMPLATE.replacen(TARGET_PLACEHOLDER, target, 1))
 }
 
-fn render_autostart(binary_path: &Path) -> Result<String> {
+fn render_desktop_entry(binary_path: &Path) -> Result<String> {
     let path = binary_path
         .to_str()
         .context("installed executable path is not valid UTF-8")?;
@@ -257,7 +266,7 @@ fn render_autostart(binary_path: &Path) -> Result<String> {
     }
     let escaped = path.replace('\\', "\\\\").replace('"', "\\\"");
     Ok(format!(
-        "{AUTOSTART_MARKER}\n[Desktop Entry]\nType=Application\nName=FxLinux\nComment=Audio enhancer control panel\nExec=\"{escaped}\"\nIcon=multimedia-volume-control\nTerminal=false\nX-GNOME-Autostart-enabled=true\n"
+        "{AUTOSTART_MARKER}\n[Desktop Entry]\nType=Application\nName=FxLinux\nComment=Audio enhancer control panel\nExec=\"{escaped}\"\nIcon=multimedia-volume-control\nTerminal=false\nCategories=AudioVideo;Audio;Settings;\nX-GNOME-Autostart-enabled=true\n"
     ))
 }
 
@@ -506,6 +515,15 @@ id 40, type PipeWire:Interface:Node
         fs::write(&path, "user managed").unwrap();
         assert!(managed_target(&path).is_err());
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn renders_indexable_desktop_entry() {
+        let entry = render_desktop_entry(Path::new("/home/test/.local/bin/fxlinux-app")).unwrap();
+        assert!(entry.starts_with(AUTOSTART_MARKER));
+        assert!(entry.contains("Name=FxLinux\n"));
+        assert!(entry.contains("Exec=\"/home/test/.local/bin/fxlinux-app\"\n"));
+        assert!(entry.contains("Categories=AudioVideo;Audio;Settings;\n"));
     }
 
     #[test]
