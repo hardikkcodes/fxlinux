@@ -1,4 +1,4 @@
-use super::model::{factory_presets, Preset};
+use super::model::{Preset, factory_presets};
 use directories::ProjectDirs;
 use std::fs;
 use std::path::PathBuf;
@@ -12,7 +12,13 @@ fn presets_dir() -> Option<PathBuf> {
 
 fn slug(name: &str) -> String {
     name.chars()
-        .map(|c| if c.is_alphanumeric() { c.to_ascii_lowercase() } else { '-' })
+        .map(|c| {
+            if c.is_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
         .collect()
 }
 
