@@ -168,7 +168,7 @@ main() {
 Set "FxLinux" as your default audio output (desktop Sound settings, or
 \`wpctl set-default <id>\`), then launch the control panel with:
 
-    $SCRIPT_DIR/target/release/fxlinux-app
+    $HOME/.local/bin/fxlinux-app
 
 It will also start automatically on your next login.
 EOF

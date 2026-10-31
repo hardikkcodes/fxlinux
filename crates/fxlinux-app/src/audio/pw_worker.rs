@@ -9,7 +9,7 @@
 //! changes over a `pipewire::channel` from the GTK thread, and reports
 //! connection status back to the GTK thread over a plain `mpsc` channel
 //! (glib's `MainContext::channel` isn't available in this version; GTK
-//! widgets aren't `Send` so the worker thread can't touch them directly —
+//! widgets aren't `Send` so the worker thread can't touch them directly.
 //! `PwWorker::spawn` hands the receiver to the caller to poll on the GTK
 //! main loop instead).
 
@@ -130,7 +130,7 @@ fn db_to_linear(db: f32) -> f32 {
 /// Every `(key, value)` pair needed to fully apply a preset: the four
 /// primary sliders' underlying controls and the 8-band EQ. Bass leveling
 /// (the multiband compressor) is static in the filter-chain config, not
-/// preset-dependent — see presets::model's module doc.
+/// preset-dependent. See presets::model's module doc.
 fn preset_updates(preset: &Preset) -> Vec<(String, f32)> {
     let mut updates: Vec<(String, f32)> = Vec::new();
 
@@ -148,7 +148,7 @@ fn preset_updates(preset: &Preset) -> Vec<(String, f32)> {
     }
 
     // Band center frequencies (16/40/100/250/630/1600/4000/10000 Hz) are the
-    // plugin's own fixed defaults, documented in presets::model — only gain
+    // plugin's own fixed defaults, documented in presets::model. Only gain
     // needs to be pushed here.
     for (i, db) in preset.eq_db.iter().enumerate() {
         updates.push((format!("eq:g_{i}"), db_to_linear(*db)));
@@ -165,7 +165,7 @@ pub struct PwWorker {
 impl PwWorker {
     /// Returns the worker plus a receiver for route-health updates.
     /// Poll the receiver from the GTK main loop (e.g. via
-    /// `glib::timeout_add_local`) — never touch GTK widgets from this
+    /// `glib::timeout_add_local`). Never touch GTK widgets from this
     /// worker's own thread.
     pub fn spawn() -> (Self, mpsc::Receiver<RouteStatus>) {
         let (sender, receiver) = pw::channel::channel::<ControlMsg>();
@@ -298,7 +298,7 @@ fn inner_run(receiver: pw::channel::Receiver<ControlMsg>, status_tx: mpsc::Sende
     let last_status_for_timer = Rc::downgrade(&last_status);
 
     let _receiver = receiver.attach(mainloop.loop_(), move |msg| {
-        // ApplyPreset is always remembered regardless of connection state —
+        // ApplyPreset is always remembered regardless of connection state.
         // sent on startup, this can race node discovery (the channel
         // message may be dispatched before the registry's initial sync
         // finds "fxlinux_input"). Storing it here means the `global`
@@ -355,8 +355,8 @@ fn report_status(
     }
 }
 
-/// Pushes every `(key, value)` pair as a single `Props` update — one struct
-/// with all pairs interleaved, one `set_param` call — rather than one call
+/// Pushes every `(key, value)` pair as a single `Props` update: one struct
+/// with all pairs interleaved and one `set_param` call, rather than one call
 /// per control, so a multi-control change (a preset, or Ambience's
 /// stereo+reverb pair) lands atomically instead of as visibly separate steps.
 fn push_controls(node: &pw::node::Node, pairs: &[(String, f32)]) {
