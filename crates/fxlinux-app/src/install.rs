@@ -29,8 +29,6 @@ enum ManagedFileDecision {
 
 pub fn run(output: Option<&str>) -> Result<()> {
     // Finish every fallible validation before changing files or service state.
-    let sink = select_sink(output)?;
-    let rendered_config = render_filter_chain(&sink.name)?;
     let base = BaseDirs::new().context("could not resolve home directory")?;
     let config_dir = base.config_dir();
     let home_dir = base.home_dir();
@@ -38,6 +36,9 @@ pub fn run(output: Option<&str>) -> Result<()> {
     let autostart_path = config_dir.join(AUTOSTART_RELATIVE_PATH);
     let binary_path = home_dir.join(".local/bin/fxlinux-app");
     let current_exe = std::env::current_exe().context("resolving current executable path")?;
+
+    let sink = select_sink(output, &config_path)?;
+    let rendered_config = render_filter_chain(&sink.name)?;
 
     validate_executable(&current_exe)?;
     let config_decision = managed_file_decision(&config_path, &rendered_config, MANAGED_MARKER)?;
@@ -84,34 +85,69 @@ pub fn uninstall() -> Result<()> {
     Ok(())
 }
 
-fn select_sink(requested_name: Option<&str>) -> Result<Sink> {
-    let inspect_target = match requested_name {
-        Some(name) => {
-            validate_node_name(name)?;
-            resolve_node_id(name)?.to_string()
-        }
-        None => "@DEFAULT_AUDIO_SINK@".to_owned(),
-    };
+fn select_sink(requested_name: Option<&str>, config_path: &Path) -> Result<Sink> {
+    if let Some(name) = requested_name {
+        return inspect_named_sink(name);
+    }
 
+    let default_inspection = inspect_sink("@DEFAULT_AUDIO_SINK@")?;
+    if inspection_property(&default_inspection, "node.name").as_deref() == Some("fxlinux_input") {
+        let target = managed_target(config_path)?;
+        return inspect_named_sink(&target).context(
+            "the physical output saved in the FxLinux config is no longer available; rerun install with --output NODE_NAME",
+        );
+    }
+
+    parse_sink_inspection(&default_inspection)
+}
+
+fn inspect_named_sink(name: &str) -> Result<Sink> {
+    validate_node_name(name)?;
+    let inspect_target = resolve_node_id(name)?.to_string();
+    let inspection = inspect_sink(&inspect_target)?;
+    let sink = parse_sink_inspection(&inspection)?;
+    if sink.name != name {
+        bail!("wpctl resolved {name} to a different node ({})", sink.name);
+    }
+    Ok(sink)
+}
+
+fn inspect_sink(inspect_target: &str) -> Result<String> {
     let output = Command::new("wpctl")
-        .args(["inspect", &inspect_target])
+        .args(["inspect", inspect_target])
         .output()
         .with_context(|| format!("inspecting output {inspect_target} with wpctl"))?;
     if !output.status.success() {
         bail!("wpctl could not inspect output {inspect_target}");
     }
-    let inspection =
-        std::str::from_utf8(&output.stdout).context("wpctl returned non-UTF-8 output")?;
-    let sink = parse_sink_inspection(inspection)?;
-    if let Some(requested) = requested_name
-        && sink.name != requested
-    {
+    Ok(std::str::from_utf8(&output.stdout)
+        .context("wpctl returned non-UTF-8 output")?
+        .to_owned())
+}
+
+fn managed_target(path: &Path) -> Result<String> {
+    let contents = fs::read_to_string(path)
+        .with_context(|| format!("reading managed FxLinux config at {}", path.display()))?;
+    if !is_managed(&contents, MANAGED_MARKER) {
         bail!(
-            "wpctl resolved {requested} to a different node ({})",
-            sink.name
+            "the default sink is FxLinux, but {} is not managed by FxLinux; rerun install with --output NODE_NAME",
+            path.display()
         );
     }
-    Ok(sink)
+
+    for line in contents.lines() {
+        let Some((key, value)) = line.trim().split_once('=') else {
+            continue;
+        };
+        if key.trim() != "target.object" {
+            continue;
+        }
+        let target = parse_quoted_value(value.trim())
+            .context("managed FxLinux config has an invalid target.object")?;
+        validate_node_name(&target)?;
+        return Ok(target);
+    }
+    bail!("managed FxLinux config has no target.object")
 }
 
 fn resolve_node_id(name: &str) -> Result<u32> {
@@ -453,6 +489,23 @@ id 40, type PipeWire:Interface:Node
         let status = " ├─ Sinks:\n │  *   40. alsa_output.first [vol: 0.59]\n │      45. alsa_output.second [vol: 1.00]\n";
         assert_eq!(parse_node_id(status, "alsa_output.second").unwrap(), 45);
         assert!(parse_node_id(status, "alsa_output.missing").is_err());
+    }
+
+    #[test]
+    fn reads_target_from_managed_config() {
+        let path = test_path("managed-target");
+        fs::write(
+            &path,
+            format!(
+                "{MANAGED_MARKER}\nplayback.props = {{\n    target.object = \"alsa_output.test\"\n}}\n"
+            ),
+        )
+        .unwrap();
+        assert_eq!(managed_target(&path).unwrap(), "alsa_output.test");
+
+        fs::write(&path, "user managed").unwrap();
+        assert!(managed_target(&path).is_err());
+        fs::remove_file(path).unwrap();
     }
 
     #[test]
